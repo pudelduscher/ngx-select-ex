@@ -24,7 +24,7 @@ import * as lodashNs from 'lodash';
 import * as escapeStringNs from 'escape-string-regexp';
 import {NgxSelectOptGroup, NgxSelectOption, TSelectOption} from './ngx-select.classes';
 import {NgxSelectOptionDirective, NgxSelectOptionNotFoundDirective, NgxSelectOptionSelectedDirective} from './ngx-templates.directive';
-import {INgxOptionNavigated, INgxSelectOptions} from './ngx-select.interfaces';
+import {INgxOptionNavigated, INgxSelectOption, INgxSelectOptions} from './ngx-select.interfaces';
 
 const _ = lodashNs;
 const escapeString = escapeStringNs;
@@ -36,7 +36,8 @@ export interface INgxSelectComponentMouseEvent extends MouseEvent {
 }
 
 enum ENavigation {
-    first, previous, next, last
+    first, previous, next, last,
+    firstSelected, firstIfOptionActiveInvisible
 }
 
 function propertyExists(obj: Object, propertyName: string) {
@@ -71,7 +72,15 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
     @Input() public autoClearSearch = false;
     @Input() public noResultsFound = 'No results found';
     @Input() public size: 'small' | 'default' | 'large' = 'default';
-    public keyCodeToRemoveSelected = 46; /*key delete*/
+    @Input() public searchCallback: (search: string, item: INgxSelectOption) => boolean;
+    public keyCodeToRemoveSelected = 'Delete';
+    public keyCodeToOptionsOpen = 'Enter';
+    public keyCodeToOptionsClose = 'Escape';
+    public keyCodeToOptionsSelect = 'Enter';
+    public keyCodeToNavigateFirst = 'ArrowLeft';
+    public keyCodeToNavigatePrevious = 'ArrowUp';
+    public keyCodeToNavigateNext = 'ArrowDown';
+    public keyCodeToNavigateLast = 'ArrowRight';
 
     @Output() public typed = new EventEmitter<string>();
     @Output() public focus = new EventEmitter<void>();
@@ -81,6 +90,7 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
     @Output() public select = new EventEmitter<any>();
     @Output() public remove = new EventEmitter<any>();
     @Output() public navigated = new EventEmitter<INgxOptionNavigated>();
+    @Output() public selectionChanges = new EventEmitter<INgxSelectOption[]>();
 
     @ViewChild('main') protected mainElRef: ElementRef;
     @ViewChild('input') protected inputElRef: ElementRef;
@@ -110,7 +120,7 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
     private cacheElementOffsetTop: number;
 
     private _focusToInput = false;
-    private isFocused = false;
+    public isFocused = false;
 
     constructor(iterableDiffers: IterableDiffers, private sanitizer: DomSanitizer, private cd: ChangeDetectorRef,
                 @Inject(NGX_SELECT_OPTIONS) @Optional() defaultOptions: INgxSelectOptions) {
@@ -122,6 +132,7 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
 
         // observers
         this.typed.subscribe((text: string) => this.subjSearchText.next(text));
+        this.subjOptionsSelected.subscribe((options: NgxSelectOption[]) => this.selectionChanges.emit(options));
         let cacheExternalValue: any[];
         const subjActualValue = this.subjExternalValue
             .map((v: any[]) => cacheExternalValue = v === null ? [] : [].concat(v))
@@ -172,15 +183,16 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
                 (options: TSelectOption[], selectedOptions: NgxSelectOption[], search: string) => {
                     this.optionsFiltered = this.filterOptions(search, options, selectedOptions);
                     this.cacheOptionsFilteredFlat = null;
-
-                    this.optionsFilteredFlat()
-                        .filter((flatOptions: NgxSelectOption[]) =>
-                            this.autoSelectSingleOption && flatOptions.length === 1 && !selectedOptions.length
-                        )
-                        .subscribe((flatOptions: NgxSelectOption[]) => this.subjOptionsSelected.next(flatOptions));
+                    this.navigateOption(ENavigation.firstIfOptionActiveInvisible);
+                    return selectedOptions;
                 }
             )
-            .subscribe();
+            .flatMap((selectedOptions: NgxSelectOption[]) => {
+                return this.optionsFilteredFlat().filter((flatOptions: NgxSelectOption[]) =>
+                    this.autoSelectSingleOption && flatOptions.length === 1 && !selectedOptions.length
+                );
+            })
+            .subscribe((flatOptions: NgxSelectOption[]) => this.subjOptionsSelected.next(flatOptions));
     }
 
     public setFormControlSize(otherClassNames: Object = {}, useFormControl: boolean = true) {
@@ -257,6 +269,15 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
                     case ENavigation.last:
                         navigated.index = options.length - 1;
                         break;
+                    case ENavigation.firstSelected:
+                        if (this.subjOptionsSelected.value.length) {
+                            navigated.index = options.indexOf(this.subjOptionsSelected.value[0]);
+                        }
+                        break;
+                    case ENavigation.firstIfOptionActiveInvisible:
+                        const idxOfOptionActive = options.indexOf(this.optionActive);
+                        navigated.index = idxOfOptionActive > 0 ? idxOfOptionActive : 0;
+                        break;
                 }
                 navigated.activeOption = options[navigated.index];
                 return navigated;
@@ -293,39 +314,52 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
     }
 
     public inputKeyDown(event: KeyboardEvent) {
-        if (event.keyCode === 13 /*key enter*/) {
+        const keysForOpenedState = [
+            this.keyCodeToOptionsSelect,
+            this.keyCodeToNavigateFirst,
+            this.keyCodeToNavigatePrevious,
+            this.keyCodeToNavigateNext,
+            this.keyCodeToNavigateLast,
+        ];
+        const keysForClosedState = [this.keyCodeToOptionsOpen, this.keyCodeToRemoveSelected];
+
+        if (this.optionsOpened && keysForOpenedState.indexOf(event.code) !== -1) {
             event.preventDefault();
             event.stopPropagation();
-            if (this.optionsOpened) {
-                this.optionSelect(this.optionActive);
-                this.navigateOption(ENavigation.next);
-            } else {
-                this.optionsOpen();
-            }
-        } else if (this.optionsOpened && [37, 38, 39, 40].indexOf(event.keyCode) !== -1) {
-            event.preventDefault();
-            event.stopPropagation();
-            switch (event.keyCode) {
-                case 37: // key arrow_left
+            switch (event.code) {
+                case this.keyCodeToOptionsSelect:
+                    this.optionSelect(this.optionActive);
+                    this.navigateOption(ENavigation.next);
+                    break;
+                case this.keyCodeToNavigateFirst:
                     this.navigateOption(ENavigation.first);
                     break;
-                case 38: // key arrow_up
+                case this.keyCodeToNavigatePrevious:
                     this.navigateOption(ENavigation.previous);
                     break;
-                case 39: // key arrow_right
+                case this.keyCodeToNavigateLast:
                     this.navigateOption(ENavigation.last);
                     break;
-                case 40: // key arrow_down
+                case this.keyCodeToNavigateNext:
                     this.navigateOption(ENavigation.next);
                     break;
             }
-        } else if (!this.optionsOpened && event.keyCode === this.keyCodeToRemoveSelected) {
-            this.optionRemove(this.subjOptionsSelected.value[this.subjOptionsSelected.value.length - 1], event);
+        } else if (!this.optionsOpened && keysForClosedState.indexOf(event.code) !== -1) {
+            event.preventDefault();
+            event.stopPropagation();
+            switch (event.code) {
+                case this.keyCodeToOptionsOpen:
+                    this.optionsOpen();
+                    break;
+                case this.keyCodeToRemoveSelected:
+                    this.optionRemove(this.subjOptionsSelected.value[this.subjOptionsSelected.value.length - 1], event);
+                    break;
+            }
         }
     }
 
     public mainKeyUp(event: KeyboardEvent): void {
-        if (event.keyCode === 27 /* key escape */) {
+        if (event.code === this.keyCodeToOptionsClose) {
             this.optionsClose(true);
         }
     }
@@ -339,34 +373,42 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
         return (this.multiple === true) || (this.optionsOpened && !this.noAutoComplete);
     }
 
-    protected inputKeyUp(event: KeyboardEvent, value: string = '') {
-        if (this.optionsOpened) {
-            if (event.key && (event.key.length === 1 || event.key === 'Backspace')) {
-                this.typed.emit(value);
-            }
-        } else if (value) {
+    /** @internal */
+    public inputKeyUp(value: string = '') {
+        if (!this.optionsOpened && value) {
             this.optionsOpen(value);
         }
     }
 
-    protected inputClick(value: string = '') {
+    /** @internal */
+    public doInputText(value: string) {
+        if (this.optionsOpened) {
+            this.typed.emit(value);
+        }
+    }
+
+    /** @internal */
+    public inputClick(value: string = '') {
         if (!this.optionsOpened) {
             this.optionsOpen(value);
         }
     }
 
-    protected sanitize(html: string): SafeHtml {
+    /** @internal */
+    public sanitize(html: string): SafeHtml {
         return html ? this.sanitizer.bypassSecurityTrustHtml(html) : null;
     }
 
-    protected highlightOption(option: NgxSelectOption): SafeHtml {
+    /** @internal */
+    public highlightOption(option: NgxSelectOption): SafeHtml {
         if (this.inputElRef) {
             return option.renderText(this.sanitizer, this.inputElRef.nativeElement.value);
         }
         return option.renderText(this.sanitizer, '');
     }
 
-    protected optionSelect(option: NgxSelectOption, event: Event = null): void {
+    /** @internal */
+    public optionSelect(option: NgxSelectOption, event: Event = null): void {
         if (event) {
             event.preventDefault();
             event.stopPropagation();
@@ -379,15 +421,17 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
         }
     }
 
-    protected optionRemove(option: NgxSelectOption, event: Event): void {
-        if (!this.disabled) {
+    /** @internal */
+    public optionRemove(option: NgxSelectOption, event: Event): void {
+        if (!this.disabled && option) {
             event.stopPropagation();
             this.subjOptionsSelected.next((this.multiple ? this.subjOptionsSelected.value : []).filter(o => o !== option));
             this.remove.emit(option.value);
         }
     }
 
-    protected isOptionActive(option: NgxSelectOption, element: HTMLElement) {
+    /** @internal */
+    public isOptionActive(option: NgxSelectOption, element: HTMLElement) {
         if (this.optionActive === option) {
             this.ensureVisibleElement(element);
             return true;
@@ -395,8 +439,10 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
         return false;
     }
 
-    protected optionActivate(navigated: INgxOptionNavigated): void {
-        if (!navigated.activeOption || !navigated.activeOption.disabled) {
+    /** @internal */
+    public optionActivate(navigated: INgxOptionNavigated): void {
+        if ((this.optionActive !== navigated.activeOption) &&
+            (!navigated.activeOption || !navigated.activeOption.disabled)) {
             this.optionActive = navigated.activeOption;
             this.navigated.emit(navigated);
         }
@@ -405,6 +451,9 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
     private filterOptions(search: string, options: TSelectOption[], selectedOptions: NgxSelectOption[]): TSelectOption[] {
         const regExp = new RegExp(escapeString(search), 'i'),
             filterOption = (option: NgxSelectOption) => {
+                if (this.searchCallback) {
+                    return this.searchCallback(search, option);
+                }
                 return (!search || regExp.test(option.text)) && (!this.multiple || selectedOptions.indexOf(option) === -1);
             };
 
@@ -431,16 +480,12 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
         }
     }
 
-    private optionsOpen(search: string = '') {
+    public optionsOpen(search: string = '') {
         if (!this.disabled) {
             this.optionsOpened = true;
             this.subjSearchText.next(search);
             if (!this.multiple && this.subjOptionsSelected.value.length) {
-                this.optionsFilteredFlat().subscribe((options: NgxSelectOption[]) => this.optionActivate({
-                    activeOption: this.subjOptionsSelected.value[0],
-                    filteredOptionList: options,
-                    index: options.indexOf(this.subjOptionsSelected.value[0])
-                }));
+                this.navigateOption(ENavigation.firstSelected);
             } else {
                 this.navigateOption(ENavigation.first);
             }
@@ -449,7 +494,7 @@ export class NgxSelectComponent implements INgxSelectOptions, ControlValueAccess
         }
     }
 
-    private optionsClose(focusToHost: boolean = false) {
+    public optionsClose(focusToHost: boolean = false) {
         this.optionsOpened = false;
         if (focusToHost) {
             const x = window.scrollX, y = window.scrollY;
